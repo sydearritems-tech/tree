@@ -1,3 +1,4 @@
+# insta-lookup API v2.4 (shared-key auth + one-time op-ids + wayback rescue + in-request replay)
 """
 Uranium Insta-Lookup — standalone Instagram profile lookup API (Vercel Python).
 
@@ -49,9 +50,10 @@ from html import unescape as _html_unescape
 # configuration
 # --------------------------------------------------------------------------
 UPSTREAM_TIMEOUT = float(os.environ.get("IG_UPSTREAM_TIMEOUT", "6"))
-FETCH_DEADLINE = float(os.environ.get("IG_FETCH_DEADLINE", "12"))  # stay well under Vercel maxDuration + client timeout
+FETCH_DEADLINE = float(os.environ.get("IG_FETCH_DEADLINE", "10"))  # per pass
+FETCH_BUDGET = float(os.environ.get("IG_FETCH_BUDGET", "18"))  # total incl. in-request retries
 CACHE_TTL_OK = int(os.environ.get("IG_CACHE_TTL_OK", "180"))
-CACHE_TTL_FAIL = int(os.environ.get("IG_CACHE_TTL_FAIL", "60"))
+CACHE_TTL_FAIL = int(os.environ.get("IG_CACHE_TTL_FAIL", "25"))
 STALE_TTL = int(os.environ.get("IG_STALE_TTL", "43200"))  # 12h grace copy
 CACHE_MAX_ENTRIES = 256
 RATE_WINDOW = 60.0
@@ -714,26 +716,41 @@ def lookup_instagram(raw_username):
     profile = None
     saw_rate = False
     saw_missing = False
-    started = time.monotonic()
-    for fetcher in FETCH_CHAIN:
+    deadline = time.monotonic() + FETCH_BUDGET
+    for _attempt in range(3):  # IG's 429 window jitters; quiet in-request replays win data
+        started = time.monotonic()
+        transient = False
+        for fetcher in FETCH_CHAIN:
+            if profile is not None and _is_complete(profile):
+                break
+            if time.monotonic() - started > FETCH_DEADLINE:
+                break  # per-pass budget; stay under Vercel maxDuration + client timeout
+            try:
+                result, err = fetcher(username)
+            except Exception as exc:  # one broken source must never 500 the request
+                print(f"[insta-lookup] {getattr(fetcher, '__name__', 'fetcher')} error: {exc}")
+                result, err = None, "source_error"
+            if result:
+                profile = _merge_profile(profile, result)
+                continue
+            if err in ("NOT_FOUND", "SOFT_NOT_FOUND"):
+                # Absence is decided only at the END of the chain: a walled host
+                # can fake a 404, and a later source can still prove existence.
+                saw_missing = True
+            elif err in ("rate_limited", "http_429", "http_503"):
+                saw_rate = True
+                transient = True
+            elif err in ("unreachable", "source_error"):
+                transient = True  # worth another pass, but not a rate verdict
         if profile is not None and _is_complete(profile):
             break
-        if time.monotonic() - started > FETCH_DEADLINE:
-            break  # budget exhausted; don't drift past Vercel's maxDuration
-        try:
-            result, err = fetcher(username)
-        except Exception as exc:  # one broken source must never 500 the request
-            print(f"[insta-lookup] {getattr(fetcher, '__name__', 'fetcher')} error: {exc}")
-            result, err = None, "source_error"
-        if result:
-            profile = _merge_profile(profile, result)
-            continue
-        if err in ("NOT_FOUND", "SOFT_NOT_FOUND"):
-            # Absence is decided only at the END of the chain: a walled host
-            # can fake a 404, and a later source can still prove existence.
-            saw_missing = True
-        elif err == "rate_limited":
-            saw_rate = True
+        if saw_missing and profile is None:
+            break  # proven absence; waiting changes nothing
+        if not transient:
+            break
+        if time.monotonic() + 1.6 > deadline:
+            break
+        time.sleep(1.2)
 
     if saw_missing and profile is None:
         payload = {"success": False, "error": "USER_NOT_FOUND"}
