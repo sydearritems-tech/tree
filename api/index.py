@@ -47,9 +47,11 @@ import requests
 # --------------------------------------------------------------------------
 # configuration
 # --------------------------------------------------------------------------
-UPSTREAM_TIMEOUT = float(os.environ.get("IG_UPSTREAM_TIMEOUT", "12"))
+UPSTREAM_TIMEOUT = float(os.environ.get("IG_UPSTREAM_TIMEOUT", "6"))
+FETCH_DEADLINE = float(os.environ.get("IG_FETCH_DEADLINE", "12"))  # stay well under Vercel maxDuration + client timeout
 CACHE_TTL_OK = int(os.environ.get("IG_CACHE_TTL_OK", "180"))
 CACHE_TTL_FAIL = int(os.environ.get("IG_CACHE_TTL_FAIL", "60"))
+STALE_TTL = int(os.environ.get("IG_STALE_TTL", "43200"))  # 12h grace copy
 CACHE_MAX_ENTRIES = 256
 RATE_WINDOW = 60.0
 RATE_MAX_PER_WINDOW = int(os.environ.get("IG_RATE_MAX", "40"))
@@ -66,7 +68,17 @@ UPSTREAM_HEADERS = {
     ),
     "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
     "x-ig-app-id": os.environ.get("IG_APP_ID", "936619743392459"),
+    "x-ig-www-claim": "0",
+    "x-asbd-id": "350685817",
+    "x-instagram-ajax": "1",
+    "sec-ch-ua": '"Chromium";v="124", "Not.A/Brand";v="24"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
 }
 JSON_HEADERS = dict(UPSTREAM_HEADERS, **{"Accept": "application/json"})
 HTML_HEADERS = dict(UPSTREAM_HEADERS, **{"Accept": "text/html,application/xhtml+xml"})
@@ -208,30 +220,43 @@ def _creds_from(headers, query, body):
 # upstream fetchers (all via the pooled session)
 # --------------------------------------------------------------------------
 def _fetch_web_profile(username):
-    """(profile|None, err|None). 'NOT_FOUND' is a definitive answer."""
-    try:
-        resp = _SESSION.get(
-            "https://i.instagram.com/api/v1/users/web_profile_info/",
-            params={"username": username},
-            headers=UPSTREAM_HEADERS,
-            timeout=UPSTREAM_TIMEOUT,
-        )
-    except requests.RequestException:
-        return None, "unreachable"
-    if resp.status_code == 404:
-        return None, "NOT_FOUND"
-    if resp.status_code in (429, 503):
-        return None, "rate_limited"
-    if resp.status_code != 200:
-        return None, f"http_{resp.status_code}"
-    try:
-        payload = resp.json()
-    except ValueError:
-        return None, "bad_json"
-    user = (payload or {}).get("data", {}).get("user")
-    if user is None:
-        return None, "NOT_FOUND"
-    return normalize_profile(user), None
+    """(profile|None, err|None). 'NOT_FOUND' is a definitive answer.
+    Tries the mobile-API host first, then the same endpoint on the web host
+    (different edges; when datacenter IPs are blocked one of the two often
+    still answers)."""
+    referer = f"https://www.instagram.com/{username}/"
+    headers = dict(UPSTREAM_HEADERS, **{"Referer": referer})
+    last_err = "unreachable"
+    saw_rate = False
+    for host in ("https://i.instagram.com", "https://www.instagram.com"):
+        try:
+            resp = _SESSION.get(
+                host + "/api/v1/users/web_profile_info/",
+                params={"username": username},
+                headers=headers,
+                timeout=UPSTREAM_TIMEOUT,
+            )
+        except requests.RequestException:
+            continue
+        if resp.status_code == 404:
+            return None, "NOT_FOUND"
+        if resp.status_code in (429, 503):
+            saw_rate = True
+            last_err = "rate_limited"
+            continue
+        if resp.status_code != 200:
+            last_err = f"http_{resp.status_code}"
+            continue
+        try:
+            payload = resp.json()
+        except ValueError:
+            last_err = "bad_json"
+            continue
+        user = (payload or {}).get("data", {}).get("user")
+        if user is None:
+            return None, "NOT_FOUND"
+        return normalize_profile(user), None
+    return None, "rate_limited" if saw_rate else last_err
 
 
 def _fetch_private_api_json(username):
@@ -276,19 +301,12 @@ def _json_escape_decode(text):
         return text.replace("\\/", "/").replace('\\"', '"')
 
 
-def _fetch_og_scrape(username):
-    url = f"https://www.instagram.com/{quote(username)}/"
-    try:
-        resp = _SESSION.get(url, headers=HTML_HEADERS, timeout=UPSTREAM_TIMEOUT)
-    except requests.RequestException:
-        return None, "unreachable"
-    if resp.status_code == 404:
-        return None, "NOT_FOUND"
-    if resp.status_code != 200:
-        return None, f"http_{resp.status_code}"
-    html = resp.text or ""
+def _parse_og_html(html, username):
+    """Extract a profile from Instagram HTML/opengraph payloads (og meta tags
+    + embedded JSON crumbs). Returns None when the page carries nothing
+    (e.g. a login wall)."""
     if "This account doesn't exist" in html or "Sorry, this page isn't available" in html:
-        return None, "NOT_FOUND"
+        return "NOT_FOUND"
     profile = {
         "username": username,
         "full_name": "",
@@ -332,10 +350,50 @@ def _fetch_og_scrape(username):
         fn = _FULLNAME_JSON_RE.search(html)
         if fn:
             profile["full_name"] = _json_escape_decode(fn.group(1))
+    if not profile["full_name"] and not profile["avatar_url"] and profile["followers"] is None:
+        return None
+    return profile
+
+
+def _fetch_opengraph(username):
+    """Crawler-facing og-meta endpoint; usually served even when the main
+    HTML page sits behind a login wall."""
+    url = f"https://www.instagram.com/{quote(username)}/opengraph"
+    try:
+        resp = _SESSION.get(url, headers=HTML_HEADERS, timeout=UPSTREAM_TIMEOUT)
+    except requests.RequestException:
+        return None, "unreachable"
+    if resp.status_code == 404:
+        return None, "NOT_FOUND"
+    if resp.status_code != 200:
+        return None, f"http_{resp.status_code}"
+    profile = _parse_og_html(resp.text or "", username)
+    if profile is None:
+        return None, "empty_html"
+    if profile == "NOT_FOUND":
+        return None, "NOT_FOUND"
     return profile, None
 
 
-FETCH_CHAIN = (_fetch_web_profile, _fetch_private_api_json, _fetch_og_scrape)
+def _fetch_og_scrape(username):
+    url = f"https://www.instagram.com/{quote(username)}/"
+    try:
+        resp = _SESSION.get(url, headers=HTML_HEADERS, timeout=UPSTREAM_TIMEOUT)
+    except requests.RequestException:
+        return None, "unreachable"
+    if resp.status_code == 404:
+        return None, "NOT_FOUND"
+    if resp.status_code != 200:
+        return None, f"http_{resp.status_code}"
+    profile = _parse_og_html(resp.text or "", username)
+    if profile is None:
+        return None, "empty_html"
+    if profile == "NOT_FOUND":
+        return None, "NOT_FOUND"
+    return profile, None
+
+
+FETCH_CHAIN = (_fetch_web_profile, _fetch_private_api_json, _fetch_opengraph, _fetch_og_scrape)
 
 
 # --------------------------------------------------------------------------
@@ -388,6 +446,7 @@ class _RateLimiter:
 
 _LOCK = threading.Lock()
 _CACHE = _TtlCache(CACHE_MAX_ENTRIES, _LOCK)
+_STALE = _TtlCache(CACHE_MAX_ENTRIES, _LOCK)
 _LIMITER = _RateLimiter(RATE_MAX_PER_WINDOW, _LOCK)
 
 
@@ -409,7 +468,10 @@ def lookup_instagram(raw_username):
 
     profile = None
     saw_rate = False
+    started = time.monotonic()
     for fetcher in FETCH_CHAIN:
+        if time.monotonic() - started > FETCH_DEADLINE:
+            break  # budget exhausted; don't drift past Vercel's maxDuration
         result, err = fetcher(username)
         if result:
             profile = result
@@ -422,6 +484,14 @@ def lookup_instagram(raw_username):
             saw_rate = True
 
     if profile is None:
+        stale = _STALE.get(username)
+        if stale is not None:
+            # upstream blocked/challenged us but we hold a recent clean copy;
+            # serve it flagged so clients know counts may lag a few minutes
+            payload = dict(stale)
+            payload["stale"] = True
+            _CACHE.set(username, (200, payload), CACHE_TTL_FAIL)
+            return 200, payload
         payload = {"success": False, "error": "RATE_LIMITED" if saw_rate else "UPSTREAM_UNAVAILABLE"}
         print(f"[insta-lookup] upstream failure user={username} rate={saw_rate}")
         _CACHE.set(username, (502, payload), CACHE_TTL_FAIL)
@@ -432,6 +502,7 @@ def lookup_instagram(raw_username):
     profile["fetched_at"] = int(time.time())
     payload = {"success": True, "data": profile}
     _CACHE.set(username, (200, payload), CACHE_TTL_OK)
+    _STALE.set(username, payload, STALE_TTL)
     return 200, payload
 
 
