@@ -43,6 +43,7 @@ from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, quote
 
 import requests
+from html import unescape as _html_unescape
 
 # --------------------------------------------------------------------------
 # configuration
@@ -140,22 +141,44 @@ def normalize_profile(user):
     if isinstance(link, dict):
         external = str(link.get("url") or "")
     if not external:
-        external = str(user.get("external_url") or "")
-    counts = user.get("edge_followed_by")
-    following = user.get("edge_follow")
-    media = user.get("edge_owner_to_timeline_media")
+        external = str(user.get("external_url") or user.get("external_url_linkshimmed") or "")
+    # Instagram serves two shapes: legacy graphql ("edge_followed_by":
+    # {"count": N}) and modern flat ("follower_count": N). Accept both.
+    def _count(*keys):
+        for key in keys:
+            value = user.get(key)
+            if isinstance(value, dict):
+                value = value.get("count")
+            parsed = parse_count(value)
+            if parsed is not None:
+                return parsed
+        return None
+    def _pic():
+        hd = user.get("hd_profile_pic_url_info")
+        if isinstance(hd, dict) and hd.get("url"):
+            return str(hd["url"])
+        for key in ("profile_pic_url_hd", "profile_pic_url"):
+            value = user.get(key)
+            if value:
+                return str(value)
+        return ""
+    bio = user.get("biography")
+    if not bio:
+        entities = user.get("biography_with_entities")
+        if isinstance(entities, dict):
+            bio = entities.get("raw_text")
     return {
         "username": username,
         "full_name": str(user.get("full_name") or ""),
-        "biography": str(user.get("biography") or ""),
+        "biography": str(bio or ""),
         "external_url": external,
         "is_verified": bool(user.get("is_verified")),
         "is_private": bool(user.get("is_private")),
-        "posts": media.get("count") if isinstance(media, dict) else None,
-        "followers": parse_count(counts.get("count") if isinstance(counts, dict) else None),
-        "following": parse_count(following.get("count") if isinstance(following, dict) else None),
-        "avatar_url": str(user.get("profile_pic_url_hd") or user.get("profile_pic_url") or ""),
-        "business_category": str(user.get("category_name") or ""),
+        "posts": _count("edge_owner_to_timeline_media", "media_count"),
+        "followers": _count("edge_followed_by", "follower_count"),
+        "following": _count("edge_follow", "following_count"),
+        "avatar_url": _pic(),
+        "business_category": str(user.get("category_name") or user.get("business_category_name") or ""),
     }
 
 
@@ -239,7 +262,13 @@ def _fetch_web_profile(username):
         except requests.RequestException:
             continue
         if resp.status_code == 404:
-            return None, "NOT_FOUND"
+            # Only positive "not found" wording proves absence; a bare or
+            # rate-limit-flavoured 404 (common when the caller IP is flagged)
+            # must fall through to the other sources as a plain error.
+            if _proves_absence(resp.text or ""):
+                return None, "NOT_FOUND"
+            last_err = "http_404"
+            continue
         if resp.status_code in (429, 503):
             saw_rate = True
             last_err = "rate_limited"
@@ -254,7 +283,7 @@ def _fetch_web_profile(username):
             continue
         user = (payload or {}).get("data", {}).get("user")
         if user is None:
-            return None, "NOT_FOUND"
+            return None, "NOT_FOUND" if (payload or {}).get("data") is not None or "data" in (payload or {}) else "SOFT_NOT_FOUND"
         return normalize_profile(user), None
     return None, "rate_limited" if saw_rate else last_err
 
@@ -290,6 +319,7 @@ _OG_IMAGE_RE = re.compile(r"<meta\s+(?:property|name)=[\"']og:image[\"']\s+conte
 _DESC_JSON_RE = re.compile(r'"biography"\s*:\s*"((?:[^"\\]|\\.)*)"')
 _PIC_JSON_RE = re.compile(r'"profile_pic_url_hd"\s*:\s*"((?:[^"\\]|\\.)*)"')
 _TITLE_NAME_RE = re.compile(r"^(.*?)\s*\(@([\w.]+)\)")
+_MISSING_RE = re.compile(r"(?:This account|Sorry, this page)[^<]{0,40}?(?:doesn|isn)['\u2019]?t", re.I)
 _OG_COUNTS_RE = re.compile(r"([\d.,kKmM]+)\s*Followers,\s*([\d.,kKmM]+)\s*Following,\s*([\d.,kKmM]+)\s*Posts")
 _FULLNAME_JSON_RE = re.compile(r'"full_name"\s*:\s*"((?:[^"\\]|\\.)*)"')
 
@@ -301,12 +331,24 @@ def _json_escape_decode(text):
         return text.replace("\\/", "/").replace('\\"', '"')
 
 
+_ABSENCE_RE = re.compile(r"(?:user not found|not found with username|this account[^<]{0,30}doesn|isn\'t available|page isn\'t available)", re.I)
+
+
+def _proves_absence(text):
+    """Absence needs POSITIVE wording; bare 404s from walled hosts mean nothing."""
+    return bool(_ABSENCE_RE.search(text or ""))
+
+
+def _parse_missing(html):
+    """Only an explicit 'account doesn't exist' page proves absence. A login
+    wall / rate-limit page must never be read as USER_NOT_FOUND."""
+    return bool(_MISSING_RE.search(html or ""))
+
+
 def _parse_og_html(html, username):
     """Extract a profile from Instagram HTML/opengraph payloads (og meta tags
     + embedded JSON crumbs). Returns None when the page carries nothing
     (e.g. a login wall)."""
-    if "This account doesn't exist" in html or "Sorry, this page isn't available" in html:
-        return "NOT_FOUND"
     profile = {
         "username": username,
         "full_name": "",
@@ -322,14 +364,14 @@ def _parse_og_html(html, username):
     }
     img = _OG_IMAGE_RE.search(html)
     if img:
-        profile["avatar_url"] = _json_escape_decode(img.group(1))
+        profile["avatar_url"] = _json_escape_decode(_html_unescape(img.group(1)))
     else:
         pic = _PIC_JSON_RE.search(html)
         if pic:
             profile["avatar_url"] = _json_escape_decode(pic.group(1))
     tmatch = _OG_TITLE_RE.search(html)
     if tmatch:
-        raw_title = _json_escape_decode(tmatch.group(1))
+        raw_title = _json_escape_decode(_html_unescape(tmatch.group(1)))
         nmatch = _TITLE_NAME_RE.match(raw_title)
         if nmatch:
             profile["full_name"] = nmatch.group(1).strip(" ()").strip()
@@ -337,7 +379,7 @@ def _parse_og_html(html, username):
             profile["full_name"] = re.sub(r"\s*.*Profile\s*•\s*Instagram.*$", "", raw_title).strip()
     desc_match = _OG_DESC_RE.search(html)
     if desc_match:
-        desc = _json_escape_decode(desc_match.group(1))
+        desc = _json_escape_decode(_html_unescape(desc_match.group(1)))
         cmatch = _OG_COUNTS_RE.search(desc)
         if cmatch:
             profile["followers"] = parse_count(cmatch.group(1))
@@ -350,9 +392,178 @@ def _parse_og_html(html, username):
         fn = _FULLNAME_JSON_RE.search(html)
         if fn:
             profile["full_name"] = _json_escape_decode(fn.group(1))
+    # login-wall pages carry generic og tags: the word "Instagram" as title
+    # and the app's own logo as og:image -- neither is real profile data
+    if "/rsrc.php" in profile["avatar_url"]:
+        profile["avatar_url"] = ""
+    if re.fullmatch(
+        r"(?:Login\s*[•·]\s*)?Instagram(?:\s*[•·]\s*[Pp]hoto\w*(?: and Videos)?)?",
+        profile["full_name"].strip(),
+    ):
+        profile["full_name"] = ""
     if not profile["full_name"] and not profile["avatar_url"] and profile["followers"] is None:
         return None
     return profile
+
+
+_EMBED_NAME_RE = re.compile(r'"full_name"\s*:\s*"((?:[^"\\]|\\.)*)"')
+_EMBED_PIC_RE = re.compile(r'"(?:profile_pic_url|hd_profile_pic_url_info)"\s*:\s*"((?:[^"\\]|\\.)*)"|"(?:profile_pic_url_hd)"\s*:\s*"((?:[^"\\]|\\.)*)"')
+_EMBED_URLS_RE = re.compile(r'"url"\s*:\s*"(https:[^"]*cdninstagram[^"]*)"')
+
+
+def _parse_embed(html, username):
+    """(profile|None, err|None) from an embed page's HTML."""
+    if not html:
+        return None, "empty_embed"
+    if "\u0026" in html:
+        html = html.encode("utf-8").decode("unicode_escape", "ignore")
+    profile = {
+        "username": "",
+        "full_name": "",
+        "biography": "",
+        "external_url": "",
+        "is_verified": bool(re.search(r'"is_verified"\s*:\s*true', html)),
+        "is_private": bool(re.search(r'"is_private"\s*:\s*true', html)),
+        "posts": None,
+        "followers": None,
+        "following": None,
+        "avatar_url": "",
+        "business_category": "",
+    }
+    if re.search(r'"username"\s*:\s*"' + re.escape(username) + '"', html, re.I):
+        profile["username"] = username.lower()
+    else:
+        return None, "no_match"
+    m = _EMBED_NAME_RE.search(html)
+    if m:
+        profile["full_name"] = _json_escape_decode(m.group(1))
+    for pic in re.findall(r'"profile_pic_url(?:_hd)?"\s*:\s*"((?:[^"\\]|\\.)*)"', html):
+        pic = _json_escape_decode(pic).replace("\\/", "/")
+        if pic.startswith("http"):
+            profile["avatar_url"] = pic
+            break
+    if not profile["avatar_url"]:
+        found = _EMBED_URLS_RE.search(html)
+        if found:
+            profile["avatar_url"] = found.group(1)
+    if not profile["full_name"] and not profile["avatar_url"]:
+        return None, "empty_embed"
+    return profile, None
+
+
+def _fetch_embed(username):
+    """Profile embed page: an iframe-embedding endpoint Instagram generally
+    does NOT login-wall, even from datacenter IPs. Carries full_name,
+    avatar and privacy flags (no counts/bio). Also the workaround for the
+    current anonymous-API 400 schema bug on business/creator accounts."""
+    url = f"https://www.instagram.com/{quote(username)}/embed/captioned/"
+    try:
+        resp = _SESSION.get(url, headers=HTML_HEADERS, timeout=UPSTREAM_TIMEOUT)
+    except requests.RequestException:
+        return None, "unreachable"
+    if resp.status_code == 404 or resp.status_code != 200:
+        if _proves_absence(getattr(resp, "text", "")):
+            return None, "SOFT_NOT_FOUND"
+        return None, f"http_{resp.status_code}"
+    if _parse_missing(resp.text or ""):
+        return None, "SOFT_NOT_FOUND"
+    return _parse_embed(resp.text or "", username)
+
+
+def _fetch_relay(username):
+    """Optional operator relay (Cloudflare Worker) used FIRST when
+    IG_RELAY_URL is configured: its egress IP is not the Vercel one, so it
+    answers even while Vercel sits behind an Instagram wall. Expected reply:
+    a web_profile_info JSON body or a flat/normalized profile object."""
+    relay = os.environ.get("IG_RELAY_URL", "").strip().rstrip("/")
+    if not relay:
+        return None, "disabled"
+    url = f"{relay}?username={quote(username)}"
+    headers = {"Accept": "application/json"}
+    secret = os.environ.get("IG_RELAY_SECRET", "").strip()
+    if secret:
+        headers["x-relay-secret"] = secret
+    try:
+        resp = _SESSION.get(url, headers=headers, timeout=UPSTREAM_TIMEOUT + 4)
+    except requests.RequestException:
+        return None, "unreachable"
+    if resp.status_code == 404:
+        return None, "NOT_FOUND"
+    if resp.status_code != 200:
+        return None, f"http_{resp.status_code}"
+    try:
+        payload = resp.json()
+    except ValueError:
+        return None, "bad_json"
+    if not isinstance(payload, dict):
+        return None, "bad_json"
+    if payload.get("error"):
+        return None, "relay_error"
+    if payload.get("via") == "embed" and isinstance(payload.get("html"), str):
+        return _parse_embed(payload["html"], username)
+    user = ((payload.get("data") or {}).get("user")) or (payload.get("profile")) or (payload if payload.get("username") else None)
+    profile = normalize_profile(user) if isinstance(user, dict) else None
+    if not profile:
+        return None, "no_user"
+    return profile, None
+
+
+def _fetch_wayback(username):
+    """archive.org is crawler-friendly and answers from any IP; its snapshot
+    of the profile page carries Instagram's own og-meta (name, counts, bio,
+    avatar). Data can lag (hours-days) so it is a fallback, flagged archived."""
+    try:
+        avail = _SESSION.get(
+            "https://archive.org/wayback/available",
+            params={"url": f"https://www.instagram.com/{username}/"},
+            headers={"Accept": "application/json"},
+            timeout=UPSTREAM_TIMEOUT,
+        )
+        if avail.status_code != 200:
+            return None, f"http_{avail.status_code}"
+        snap = ((avail.json() or {}).get("archived_snapshots") or {}).get("closest") or {}
+        snap_url = str(snap.get("url") or "")
+        ts = str(snap.get("timestamp") or "")
+    except (requests.RequestException, ValueError):
+        return None, "unreachable"
+    if not snap_url:
+        return None, "no_snapshot"
+    # Use archive.org's own URL (it knows the exact captured spelling, e.g. a
+    # capitalised redirect target); only rewrite to the raw-content variant.
+    targets = [re.sub(r"/web/(\d{14})/?", r"/web/\1id_/", snap_url.replace("http://", "https://", 1))]
+    rebuilt = f"https://web.archive.org/web/{ts}id_/https://www.instagram.com/{username}/"
+    if rebuilt not in targets:
+        targets.append(rebuilt)
+    resp = None
+    last_target_err = "no_snapshot"
+    for target in targets:
+        try:
+            cand = _SESSION.get(target, headers=HTML_HEADERS, timeout=UPSTREAM_TIMEOUT + 6)
+        except requests.RequestException:
+            last_target_err = "unreachable"
+            continue
+        if cand.status_code == 200:
+            resp = cand
+            break
+        last_target_err = "no_snapshot" if cand.status_code == 404 else f"http_{cand.status_code}"
+    if resp is None:
+        return None, last_target_err
+    if resp.status_code == 404:
+        return None, "no_snapshot"
+    if resp.status_code != 200:
+        return None, f"http_{resp.status_code}"
+    html = resp.text or ""
+    if _parse_missing(html):
+        return None, "NOT_FOUND"
+    profile = _parse_og_html(html, username)
+    if profile is None:
+        return None, "empty_html"
+    profile["archived"] = True
+    try:
+        profile["snapshot_at"] = int(time.mktime(time.strptime(ts, "%Y%m%d%H%M%S")))
+    except (ValueError, TypeError):
+        pass
+    return profile, None
 
 
 def _fetch_opengraph(username):
@@ -364,14 +575,17 @@ def _fetch_opengraph(username):
     except requests.RequestException:
         return None, "unreachable"
     if resp.status_code == 404:
-        return None, "NOT_FOUND"
+        if _proves_absence(resp.text or ""):
+            return None, "SOFT_NOT_FOUND"
+        return None, "http_404"
     if resp.status_code != 200:
         return None, f"http_{resp.status_code}"
-    profile = _parse_og_html(resp.text or "", username)
+    html = resp.text or ""
+    if _parse_missing(html):
+        return None, "SOFT_NOT_FOUND"
+    profile = _parse_og_html(html, username)
     if profile is None:
         return None, "empty_html"
-    if profile == "NOT_FOUND":
-        return None, "NOT_FOUND"
     return profile, None
 
 
@@ -382,18 +596,49 @@ def _fetch_og_scrape(username):
     except requests.RequestException:
         return None, "unreachable"
     if resp.status_code == 404:
-        return None, "NOT_FOUND"
+        if _proves_absence(resp.text or ""):
+            return None, "SOFT_NOT_FOUND"
+        return None, "http_404"
     if resp.status_code != 200:
         return None, f"http_{resp.status_code}"
-    profile = _parse_og_html(resp.text or "", username)
+    html = resp.text or ""
+    if _parse_missing(html):
+        return None, "SOFT_NOT_FOUND"
+    profile = _parse_og_html(html, username)
     if profile is None:
         return None, "empty_html"
-    if profile == "NOT_FOUND":
-        return None, "NOT_FOUND"
     return profile, None
 
 
-FETCH_CHAIN = (_fetch_web_profile, _fetch_private_api_json, _fetch_opengraph, _fetch_og_scrape)
+FETCH_CHAIN = (
+    _fetch_relay, _fetch_web_profile, _fetch_private_api_json,
+    _fetch_embed, _fetch_wayback, _fetch_opengraph, _fetch_og_scrape,
+)
+
+# fields that make a profile "complete" -> stop querying more sources
+_PRIMARY_FIELDS = ("full_name", "avatar_url", "followers", "following", "posts")
+
+
+def _is_filled(value):
+    return value not in (None, "")
+
+
+def _merge_profile(base, extra):
+    """Fill missing keys of `base` from `extra` (first source wins)."""
+    if base is None:
+        return dict(extra)
+    for key, value in extra.items():
+        if key == "username":
+            if not base.get("username") and value:
+                base["username"] = value
+            continue
+        if not _is_filled(base.get(key)) and _is_filled(value):
+            base[key] = value
+    return base
+
+
+def _is_complete(profile):
+    return all(_is_filled(profile.get(key)) for key in _PRIMARY_FIELDS)
 
 
 # --------------------------------------------------------------------------
@@ -468,20 +713,32 @@ def lookup_instagram(raw_username):
 
     profile = None
     saw_rate = False
+    saw_missing = False
     started = time.monotonic()
     for fetcher in FETCH_CHAIN:
+        if profile is not None and _is_complete(profile):
+            break
         if time.monotonic() - started > FETCH_DEADLINE:
             break  # budget exhausted; don't drift past Vercel's maxDuration
-        result, err = fetcher(username)
+        try:
+            result, err = fetcher(username)
+        except Exception as exc:  # one broken source must never 500 the request
+            print(f"[insta-lookup] {getattr(fetcher, '__name__', 'fetcher')} error: {exc}")
+            result, err = None, "source_error"
         if result:
-            profile = result
-            break
-        if err == "NOT_FOUND":
-            payload = {"success": False, "error": "USER_NOT_FOUND"}
-            _CACHE.set(username, (404, payload), CACHE_TTL_FAIL)
-            return 404, payload
-        if err == "rate_limited":
+            profile = _merge_profile(profile, result)
+            continue
+        if err in ("NOT_FOUND", "SOFT_NOT_FOUND"):
+            # Absence is decided only at the END of the chain: a walled host
+            # can fake a 404, and a later source can still prove existence.
+            saw_missing = True
+        elif err == "rate_limited":
             saw_rate = True
+
+    if saw_missing and profile is None:
+        payload = {"success": False, "error": "USER_NOT_FOUND"}
+        _CACHE.set(username, (404, payload), CACHE_TTL_FAIL)
+        return 404, payload
 
     if profile is None:
         stale = _STALE.get(username)
@@ -501,6 +758,12 @@ def lookup_instagram(raw_username):
     profile.setdefault("username", username)
     profile["fetched_at"] = int(time.time())
     payload = {"success": True, "data": profile}
+    if not _is_complete(profile):
+        payload["partial"] = True
+        # incomplete data may become available seconds later - don't sit on
+        # it for the full ok-ttl, and don't poison the 12h stale bucket
+        _CACHE.set(username, (200, payload), min(CACHE_TTL_FAIL, 30))
+        return 200, payload
     _CACHE.set(username, (200, payload), CACHE_TTL_OK)
     _STALE.set(username, payload, STALE_TTL)
     return 200, payload
