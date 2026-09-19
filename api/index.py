@@ -1,4 +1,4 @@
-# insta-lookup API v2.4 (shared-key auth + one-time op-ids + wayback rescue + in-request replay)
+# insta-lookup API v2.5 (shared-key auth + one-time op-ids + wayback rescue + in-request replay + background warm)
 """
 Uranium Insta-Lookup — standalone Instagram profile lookup API (Vercel Python).
 
@@ -53,7 +53,8 @@ UPSTREAM_TIMEOUT = float(os.environ.get("IG_UPSTREAM_TIMEOUT", "6"))
 FETCH_DEADLINE = float(os.environ.get("IG_FETCH_DEADLINE", "10"))  # per pass
 FETCH_BUDGET = float(os.environ.get("IG_FETCH_BUDGET", "18"))  # total incl. in-request retries
 CACHE_TTL_OK = int(os.environ.get("IG_CACHE_TTL_OK", "180"))
-CACHE_TTL_FAIL = int(os.environ.get("IG_CACHE_TTL_FAIL", "25"))
+CACHE_TTL_FAIL = int(os.environ.get("IG_CACHE_TTL_FAIL", "25"))  # absence cache
+CACHE_TTL_BUSY = float(os.environ.get("IG_CACHE_TTL_BUSY", "5"))  # rate/upstream: brief guard only
 STALE_TTL = int(os.environ.get("IG_STALE_TTL", "43200"))  # 12h grace copy
 CACHE_MAX_ENTRIES = 256
 RATE_WINDOW = 60.0
@@ -698,6 +699,69 @@ _LIMITER = _RateLimiter(RATE_MAX_PER_WINDOW, _LOCK)
 
 
 # --------------------------------------------------------------------------
+# background warming: when IG briefly 429s us, don't just fail - keep trying
+# for a while in a daemon thread (Vercel keeps warm containers alive between
+# invocations), so the user's NEXT click lands on fresh cached data.
+# --------------------------------------------------------------------------
+WARM_SECONDS = float(os.environ.get("IG_WARM_SECONDS", "150"))
+WARM_INTERVAL = float(os.environ.get("IG_WARM_INTERVAL", "8"))
+WARM_MAX_CONCURRENT = 8
+_WARMING = set()
+_WARM_LOCK = threading.Lock()
+
+
+def _warm_pass(username):
+    """One fresh pass through the fetch chain; returns merged profile|None."""
+    profile = None
+    started = time.monotonic()
+    for fetcher in FETCH_CHAIN:
+        if profile is not None and _is_complete(profile):
+            break
+        if time.monotonic() - started > FETCH_DEADLINE:
+            break
+        try:
+            result, err = fetcher(username)
+        except Exception:
+            continue
+        if result:
+            profile = _merge_profile(profile, result)
+    return profile
+
+
+def _warm_loop(username):
+    try:
+        deadline = time.monotonic() + WARM_SECONDS
+        while time.monotonic() < deadline:
+            time.sleep(WARM_INTERVAL)
+            profile = _warm_pass(username)
+            if profile is not None:
+                prof = {k: v for k, v in profile.items() if v not in (None, "")}
+                prof.setdefault("username", username)
+                prof["fetched_at"] = int(time.time())
+                payload = {"success": True, "data": prof}
+                if _is_complete(profile):
+                    _CACHE.set(username, (200, payload), CACHE_TTL_OK)
+                    _STALE.set(username, payload, STALE_TTL)
+                else:
+                    payload["partial"] = True
+                    _CACHE.set(username, (200, payload), int(CACHE_TTL_OK / 2))
+                print(f"[insta-lookup] warm success user={username}")
+                return
+    finally:
+        with _WARM_LOCK:
+            _WARMING.discard(username)
+
+
+def _spawn_warm(username):
+    with _WARM_LOCK:
+        if username in _WARMING or len(_WARMING) >= WARM_MAX_CONCURRENT:
+            return False
+        _WARMING.add(username)
+    threading.Thread(target=_warm_loop, args=(username,), daemon=True).start()
+    return True
+
+
+# --------------------------------------------------------------------------
 # lookup core (pure; auth is layered on top by the handler)
 # --------------------------------------------------------------------------
 def lookup_instagram(raw_username):
@@ -768,7 +832,8 @@ def lookup_instagram(raw_username):
             return 200, payload
         payload = {"success": False, "error": "RATE_LIMITED" if saw_rate else "UPSTREAM_UNAVAILABLE"}
         print(f"[insta-lookup] upstream failure user={username} rate={saw_rate}")
-        _CACHE.set(username, (502, payload), CACHE_TTL_FAIL)
+        _CACHE.set(username, (502, payload), CACHE_TTL_BUSY)
+        _spawn_warm(username)  # keep trying in the background for the next click
         return 502, payload
 
     profile = {k: v for k, v in profile.items() if v not in (None, "")}
