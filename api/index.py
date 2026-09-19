@@ -1,35 +1,43 @@
 """
 Uranium Insta-Lookup — standalone Instagram profile lookup API (Vercel Python).
 
-Completely independent from the main Uranium API (no keys, no plans, no
-Supabase). One deployment, one job: username in -> normalized public profile
-data out.
+v2: shared-key auth + one-time operation ids (nonce+timestamp) + replay lock.
+Nothing on this endpoint is usable by anyone who does not hold the shared key,
+and a captured request (e.g. via an HTTP spy on a leaked client) is worth
+exactly one already-consumed operation id: it cannot be replayed by anyone,
+including the original caller, after the 90s window or once used.
 
-Endpoints (all public):
-  GET  /?username=<handle>        -> lookup (handle may include a leading @)
-  GET  /api/index.py?username=... -> same (direct-invocation fallback)
-  GET  /img?username=<handle>     -> 302 to the HD profile picture (for
-                                     clients that cannot follow CDN refs)
-  GET  /health                    -> {"success": true, ...}
-  POST / {"action":"instagram_lookup","username":"..."}
+Endpoints:
+  GET  /health                                  -> open uptime probe only
+  POST / {"action":"instagram_lookup",
+          "username":"...", "key":"...",
+          "nonce":"...", "ts":<unix>}           -> the client path (Lua uses this)
+  GET  /?username=... (headers x-insta-key,
+       x-op-nonce, x-op-ts)                     -> same, for quick manual checks
+  GET  /img?username=... (same auth)            -> 302 to HD profile picture
+
+Everything else: 404 with no information. No usage text, no upstream error
+details in responses (they stay in the instance log).
 
 Upstreams (tried in order, first hit wins):
-  1. i.instagram.com  web_profile_info  (rich JSON, no auth needed)
-  2. instagram.com    legacy ?__a=1     (sometimes still serves JSON)
-  3. instagram.com    public page       (Open Graph + embedded JSON scrape)
-A definitive "user: null" from step 1 short-circuits to 404 USER_NOT_FOUND,
-so missing accounts never trigger extra hammering.
+  1. i.instagram.com  web_profile_info   (rich JSON, no login)
+  2. instagram.com    legacy ?__a=1      (regional leftovers)
+  3. instagram.com    public OG scrape   (meta tags + embedded JSON regexes)
+A definitive "user: null" short-circuits to 404 USER_NOT_FOUND.
 
-Results are cached in-process (180s ok / 60s failures) with a bounded LRU,
-plus a lightweight best-effort per-IP rate limit (serverless instances are
-small buckets; put a real limiter in front if you ever need one).
+Optimizations: keep-alive session with pooled connections, headers pre-built
+once, cache-first (180s ok / 60s fail, bounded LRU), pure-function core (no
+handler dependencies), .python-version pins the runtime, vercel.json caps
+maxDuration. Rate limit: 40 req/min/IP (best-effort per warm instance).
 """
 
+import hashlib
+import hmac
 import json
 import os
 import re
-import time
 import threading
+import time
 from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, quote
@@ -46,35 +54,49 @@ CACHE_MAX_ENTRIES = 256
 RATE_WINDOW = 60.0
 RATE_MAX_PER_WINDOW = int(os.environ.get("IG_RATE_MAX", "40"))
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
-IG_HEADERS = {
-    "User-Agent": USER_AGENT,
+# auth ---------------------------------------------------------------------
+INSTA_SHARED_KEY = os.environ.get("INSTA_SHARED_KEY", "").strip()
+OP_TS_WINDOW = 90  # seconds of validity for a client operation id
+NONCE_STORE_TTL = 240  # keep seen nonces at least 2x the validity window
+
+UPSTREAM_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
     "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9",
     "x-ig-app-id": os.environ.get("IG_APP_ID", "936619743392459"),
 }
+JSON_HEADERS = dict(UPSTREAM_HEADERS, **{"Accept": "application/json"})
+HTML_HEADERS = dict(UPSTREAM_HEADERS, **{"Accept": "text/html,application/xhtml+xml"})
+
 USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
 
-# "3.456", "12.4k", "1.2 million", "1200000" -> int
-_COUNT_RE = re.compile(r"([\d.,]+)\s*([km])?|([\d.,]+)", re.IGNORECASE)
+# keep-alive session shared across warm invocations (Vercel reuses containers)
+_SESSION = requests.Session()
+try:
+    _adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=8)
+    _SESSION.mount("https://", _adapter)
+except Exception:
+    pass
 
 
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
 def parse_count(value):
-    """Normalize Instagram follower counters (int, '12.4k', '3,456', ...)."""
-    if value is None:
-        return None
-    if isinstance(value, bool):
+    """Normalize Instagram counters (int, '12.4k', '3,456', '2 million')."""
+    if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
         return max(0, int(value))
     text = str(value).strip().lower().replace(",", "").replace(" ", "")
-    text = re.sub(r"(million|billion|thousand)$", lambda m: {"million": "m", "billion": "b", "thousand": "k"}[m.group(1)], text)
+    text = re.sub(
+        r"(million|billion|thousand)$",
+        lambda m: {"million": "m", "billion": "b", "thousand": "k"}[m.group(1)],
+        text,
+    )
     match = re.match(r"^([\d.]+)([kmb])?$", text)
     if not match:
         return None
@@ -96,19 +118,15 @@ def clean_username(raw):
 
 
 def normalize_profile(user):
-    """web_profile_info user object -> compact, GUI-ready payload."""
     if not isinstance(user, dict):
         return None
     username = str(user.get("username") or "").lower()
     if not username:
         return None
-    full_name = str(user.get("full_name") or "")
-    biography = str(user.get("biography") or "")
     external = ""
-    for item in user.get("external_url_link") and [user.get("external_url_link")] or []:
-        if isinstance(item, dict):
-            external = str(item.get("url") or "")
-            break
+    link = user.get("external_url_link")
+    if isinstance(link, dict):
+        external = str(link.get("url") or "")
     if not external:
         external = str(user.get("external_url") or "")
     counts = user.get("edge_followed_by")
@@ -116,12 +134,12 @@ def normalize_profile(user):
     media = user.get("edge_owner_to_timeline_media")
     return {
         "username": username,
-        "full_name": full_name,
-        "biography": biography,
+        "full_name": str(user.get("full_name") or ""),
+        "biography": str(user.get("biography") or ""),
         "external_url": external,
         "is_verified": bool(user.get("is_verified")),
         "is_private": bool(user.get("is_private")),
-        "posts": (media or {}).get("count") if isinstance(media, dict) else None,
+        "posts": media.get("count") if isinstance(media, dict) else None,
         "followers": parse_count(counts.get("count") if isinstance(counts, dict) else None),
         "following": parse_count(following.get("count") if isinstance(following, dict) else None),
         "avatar_url": str(user.get("profile_pic_url_hd") or user.get("profile_pic_url") or ""),
@@ -130,29 +148,86 @@ def normalize_profile(user):
 
 
 # --------------------------------------------------------------------------
-# upstream fetchers
+# auth: shared key + one-time operation (nonce + ts)
+# --------------------------------------------------------------------------
+class _NonceStore:
+    """Single-use operation ids with TTL pruning."""
+
+    def __init__(self, lock):
+        self._seen = OrderedDict()
+        self._lock = lock
+
+    def consume(self, nonce):
+        """True if nonce is fresh; False if already used."""
+        now = time.time()
+        with self._lock:
+            while self._seen:
+                _, exp = next(iter(self._seen.values()))
+                if exp >= now:
+                    break
+                self._seen.popitem(last=False)
+            if nonce in self._seen:
+                return False
+            self._seen[nonce] = (hashlib.sha256(nonce.encode()).hexdigest()[:16], now + NONCE_STORE_TTL)
+            while len(self._seen) > 50000:
+                self._seen.popitem(last=False)
+            return True
+
+
+_NONCES = _NonceStore(threading.Lock())
+
+
+def check_operation(key, nonce, ts):
+    """-> (ok, error_code|None). Pure except for nonce consumption."""
+    if not INSTA_SHARED_KEY:
+        return False, "CONFIG_MISSING"
+    if not isinstance(key, str) or not hmac.compare_digest(key.encode("utf-8", "ignore"), INSTA_SHARED_KEY.encode()):
+        return False, "INVALID_KEY"
+    try:
+        ts_val = float(ts)
+    except (TypeError, ValueError):
+        return False, "MISSING_TIMESTAMP"
+    if abs(time.time() - ts_val) > OP_TS_WINDOW:
+        return False, "STALE_TIMESTAMP"
+    if not isinstance(nonce, str) or len(nonce) < 8 or len(nonce) > 128:
+        return False, "MISSING_NONCE"
+    if not _NONCES.consume(nonce):
+        return False, "REPLAY_DETECTED"
+    return True, None
+
+
+def _creds_from(headers, query, body):
+    body = body if isinstance(body, dict) else {}
+    key = str(body.get("key") or (headers.get("x-insta-key") if headers else "") or (query.get("k") or [""])[0])
+    nonce = str(body.get("nonce") or (headers.get("x-op-nonce") if headers else "") or (query.get("n") or [""])[0])
+    ts = body.get("ts") or (headers.get("x-op-ts") if headers else "") or (query.get("t") or [""])[0]
+    return key, nonce, ts
+
+
+# --------------------------------------------------------------------------
+# upstream fetchers (all via the pooled session)
 # --------------------------------------------------------------------------
 def _fetch_web_profile(username):
-    """(profile|None, error|None). error 'NOT_FOUND' is definitive."""
+    """(profile|None, err|None). 'NOT_FOUND' is a definitive answer."""
     try:
-        resp = requests.get(
+        resp = _SESSION.get(
             "https://i.instagram.com/api/v1/users/web_profile_info/",
             params={"username": username},
-            headers=IG_HEADERS,
+            headers=UPSTREAM_HEADERS,
             timeout=UPSTREAM_TIMEOUT,
         )
-    except requests.RequestException as exc:
-        return None, f"web_profile_unreachable:{type(exc).__name__}"
+    except requests.RequestException:
+        return None, "unreachable"
     if resp.status_code == 404:
         return None, "NOT_FOUND"
     if resp.status_code in (429, 503):
-        return None, f"web_profile_rate_limited:{resp.status_code}"
+        return None, "rate_limited"
     if resp.status_code != 200:
-        return None, f"web_profile_http_{resp.status_code}"
+        return None, f"http_{resp.status_code}"
     try:
         payload = resp.json()
     except ValueError:
-        return None, "web_profile_bad_json"
+        return None, "bad_json"
     user = (payload or {}).get("data", {}).get("user")
     if user is None:
         return None, "NOT_FOUND"
@@ -160,41 +235,27 @@ def _fetch_web_profile(username):
 
 
 def _fetch_private_api_json(username):
-    """Legacy ?__a=1 endpoint; works on some regions/rollouts only."""
+    url = f"https://www.instagram.com/{quote(username)}/"
     try:
-        resp = requests.get(
-            f"https://www.instagram.com/{quote(username)}/",
-            params={"__a": "1", "__d": "dis"},
-            headers={**IG_HEADERS, "Accept": "application/json"},
-            timeout=UPSTREAM_TIMEOUT,
-        )
-    except requests.RequestException as exc:
-        return None, f"legacy_unreachable:{type(exc).__name__}"
+        resp = _SESSION.get(url, params={"__a": "1", "__d": "dis"}, headers=JSON_HEADERS, timeout=UPSTREAM_TIMEOUT)
+    except requests.RequestException:
+        return None, "unreachable"
     if resp.status_code != 200:
-        return None, f"legacy_http_{resp.status_code}"
+        return None, f"http_{resp.status_code}"
     text = (resp.text or "").strip()
     brace = text.find("{")
     if brace < 0:
-        return None, "legacy_not_json"
+        return None, "not_json"
     try:
         payload = json.loads(text[brace:])
     except ValueError:
-        return None, "legacy_bad_json"
+        return None, "bad_json"
     user = (payload or {}).get("data", {}).get("user") or (payload or {}).get("user") or {}
-    graf = ((user.get("graphql") or {}) if isinstance(user, dict) else {})
-    profile = normalize_profile(user) or normalize_profile(graf)
+    if not isinstance(user, dict):
+        return None, "no_user"
+    profile = normalize_profile(user) or normalize_profile(user.get("graphql") or {})
     if not profile:
-        return None, "legacy_no_user"
-    # legacy shape nests some fields under graphql
-    extra = graf or {}
-    def _pick(key, path_count):
-        node = extra.get(path_count)
-        return node.get("count") if isinstance(node, dict) else None
-    for field, path in (("followers", "edge_followed_by"), ("following", "edge_follow"), ("posts", "edge_owner_to_timeline_media")):
-        if profile.get(field) in (None, "") and _pick(field, path) is not None:
-            profile[field] = parse_count(_pick(field, path))
-    if not profile.get("avatar_url"):
-        profile["avatar_url"] = str(extra.get("profile_pic_url_hd") or extra.get("profile_pic_url") or "")
+        return None, "no_user"
     return profile, None
 
 
@@ -205,6 +266,7 @@ _DESC_JSON_RE = re.compile(r'"biography"\s*:\s*"((?:[^"\\]|\\.)*)"')
 _PIC_JSON_RE = re.compile(r'"profile_pic_url_hd"\s*:\s*"((?:[^"\\]|\\.)*)"')
 _TITLE_NAME_RE = re.compile(r"^(.*?)\s*\(@([\w.]+)\)")
 _OG_COUNTS_RE = re.compile(r"([\d.,kKmM]+)\s*Followers,\s*([\d.,kKmM]+)\s*Following,\s*([\d.,kKmM]+)\s*Posts")
+_FULLNAME_JSON_RE = re.compile(r'"full_name"\s*:\s*"((?:[^"\\]|\\.)*)"')
 
 
 def _json_escape_decode(text):
@@ -215,27 +277,18 @@ def _json_escape_decode(text):
 
 
 def _fetch_og_scrape(username):
-    """Public profile page: Open Graph meta + first embedded JSON hits."""
+    url = f"https://www.instagram.com/{quote(username)}/"
     try:
-        resp = requests.get(
-            f"https://www.instagram.com/{quote(username)}/",
-            headers={**IG_HEADERS, "Accept": "text/html,application/xhtml+xml"},
-            timeout=UPSTREAM_TIMEOUT,
-        )
-    except requests.RequestException as exc:
-        return None, f"og_unreachable:{type(exc).__name__}"
+        resp = _SESSION.get(url, headers=HTML_HEADERS, timeout=UPSTREAM_TIMEOUT)
+    except requests.RequestException:
+        return None, "unreachable"
     if resp.status_code == 404:
         return None, "NOT_FOUND"
     if resp.status_code != 200:
-        return None, f"og_http_{resp.status_code}"
+        return None, f"http_{resp.status_code}"
     html = resp.text or ""
     if "This account doesn't exist" in html or "Sorry, this page isn't available" in html:
         return None, "NOT_FOUND"
-    title = (_OG_TITLE_RE.search(html) or [None, ""])[1] if _OG_TITLE_RE.search(html) else ""
-    desc = ""
-    m = _OG_DESC_RE.search(html)
-    if m:
-        desc = _json_escape_decode(m.group(1))
     profile = {
         "username": username,
         "full_name": "",
@@ -261,25 +314,22 @@ def _fetch_og_scrape(username):
         raw_title = _json_escape_decode(tmatch.group(1))
         nmatch = _TITLE_NAME_RE.match(raw_title)
         if nmatch:
-            profile["full_name"] = nmatch.group(1).replace(" (@", "(").strip(" ()").strip()
+            profile["full_name"] = nmatch.group(1).strip(" ()").strip()
         elif raw_title:
             profile["full_name"] = re.sub(r"\s*.*Profile\s*•\s*Instagram.*$", "", raw_title).strip()
-    if desc:
+    desc_match = _OG_DESC_RE.search(html)
+    if desc_match:
+        desc = _json_escape_decode(desc_match.group(1))
         cmatch = _OG_COUNTS_RE.search(desc)
         if cmatch:
             profile["followers"] = parse_count(cmatch.group(1))
             profile["following"] = parse_count(cmatch.group(2))
             profile["posts"] = parse_count(cmatch.group(3))
-        # og:description ends with the bio when one exists:
-        # "123 Followers, 45 Following, 6 Posts - See Instagram photos and videos from X (@y)"
-        bmatch = re.match(r"^(.*?)\s+-\s+See Instagram", desc)
-        if bmatch and len(bmatch.group(1)) > 0 and not re.match(r"^[\d.,km]+\s*Followers$", bmatch.group(1), re.IGNORECASE):
-            profile["biography"] = ""  # og bio text is the account name, not biography; keep clean
     bio = _DESC_JSON_RE.search(html)
     if bio:
         profile["biography"] = _json_escape_decode(bio.group(1))[:2000]
     if not profile["full_name"]:
-        fn = re.search(r'"full_name"\s*:\s*"((?:[^"\\]|\\.)*)"', html)
+        fn = _FULLNAME_JSON_RE.search(html)
         if fn:
             profile["full_name"] = _json_escape_decode(fn.group(1))
     return profile, None
@@ -289,7 +339,7 @@ FETCH_CHAIN = (_fetch_web_profile, _fetch_private_api_json, _fetch_og_scrape)
 
 
 # --------------------------------------------------------------------------
-# cache + rate limit
+# cache + rate limiter
 # --------------------------------------------------------------------------
 class _TtlCache:
     def __init__(self, max_entries, lock):
@@ -342,13 +392,13 @@ _LIMITER = _RateLimiter(RATE_MAX_PER_WINDOW, _LOCK)
 
 
 # --------------------------------------------------------------------------
-# lookup core
+# lookup core (pure; auth is layered on top by the handler)
 # --------------------------------------------------------------------------
 def lookup_instagram(raw_username):
-    """-> (status:int, payload:dict). Pure function; used by HTTP handler and tests."""
+    """-> (status:int, payload:dict)."""
     username = clean_username(raw_username)
     if not username:
-        return 400, {"success": False, "error": "INVALID_USERNAME", "detail": "1-30 chars, letters/digits/dot/underscore only"}
+        return 400, {"success": False, "error": "INVALID_USERNAME"}
 
     cached = _CACHE.get(username)
     if cached is not None:
@@ -358,25 +408,22 @@ def lookup_instagram(raw_username):
         return status, payload
 
     profile = None
-    errors = []
-    not_found = False
+    saw_rate = False
     for fetcher in FETCH_CHAIN:
         result, err = fetcher(username)
         if result:
             profile = result
             break
         if err == "NOT_FOUND":
-            not_found = True
-            break
-        if err:
-            errors.append(err)
+            payload = {"success": False, "error": "USER_NOT_FOUND"}
+            _CACHE.set(username, (404, payload), CACHE_TTL_FAIL)
+            return 404, payload
+        if err == "rate_limited":
+            saw_rate = True
 
-    if not_found:
-        payload = {"success": False, "error": "USER_NOT_FOUND", "detail": f"@{username} yok veya erişilemiyor"}
-        _CACHE.set(username, (404, payload), CACHE_TTL_FAIL)
-        return 404, payload
     if profile is None:
-        payload = {"success": False, "error": "UPSTREAM_UNAVAILABLE", "detail": "; ".join(errors) or "all fetchers failed"}
+        payload = {"success": False, "error": "RATE_LIMITED" if saw_rate else "UPSTREAM_UNAVAILABLE"}
+        print(f"[insta-lookup] upstream failure user={username} rate={saw_rate}")
         _CACHE.set(username, (502, payload), CACHE_TTL_FAIL)
         return 502, payload
 
@@ -389,35 +436,44 @@ def lookup_instagram(raw_username):
 
 
 # --------------------------------------------------------------------------
-# HTTP handler (Vercel Python runtime: class `handler(BaseHTTPRequestHandler)`)
+# HTTP handler
 # --------------------------------------------------------------------------
 class handler(BaseHTTPRequestHandler):
-    server_version = "UraniumInstaLookup/1.0"
+    server_version = "UraniumInstaLookup/2.0"
 
-    def log_message(self, fmt, *args):  # keep the runtime log clean
+    def log_message(self, fmt, *args):  # keep the runtime log quiet
         pass
 
-    def _json(self, payload, status=200, extra_headers=None):
+    def _json(self, payload, status=200):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, x-insta-key, x-op-nonce, x-op-ts")
         self.send_header("Cache-Control", "no-store")
-        for key, value in (extra_headers or {}).items():
-            self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
+
+    _DENY_STATUS = {
+        "INVALID_KEY": 401, "STALE_TIMESTAMP": 401, "MISSING_TIMESTAMP": 401,
+        "MISSING_NONCE": 400, "REPLAY_DETECTED": 403, "CONFIG_MISSING": 503,
+        "USER_NOT_FOUND": 404, "NOT_FOUND": 404, "BAD_BODY": 400,
+        "BAD_JSON": 400, "UNKNOWN_ACTION": 400, "INTERNAL": 500,
+    }
+
+    def _deny(self, code):
+        # no internals: one code, nothing else
+        self._json({"success": False, "error": code}, self._DENY_STATUS.get(code, 400))
 
     def _client_ip(self):
         fwd = str(self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
         return fwd or (self.client_address[0] if self.client_address else "unknown")
 
-    def _rate_checked(self):
+    def _rate_ok(self):
         if not _LIMITER.allow(self._client_ip()):
-            self._json({"success": False, "error": "RATE_LIMITED"}, 429, {"Retry-After": "30"})
+            self._json({"success": False, "error": "RATE_LIMITED"}, 429)
             return False
         return True
 
@@ -425,41 +481,46 @@ class handler(BaseHTTPRequestHandler):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, x-insta-key, x-op-nonce, x-op-ts")
         self.send_header("Access-Control-Max-Age", "86400")
         self.end_headers()
 
     def do_GET(self):
         try:
-            # behind Vercel's rewrites the function receives the destination
-            # path; x-matched-path carries the original request path.
             raw_path = self.headers.get("X-Matched-Path") or self.path
             parsed = urlparse(raw_path)
             if not (parsed.query or ""):
                 parsed = parsed._replace(query=urlparse(self.path).query)
             path = parsed.path.rstrip("/") or "/"
-            if path in ("/", "/api/index.py", "/api", "/index"):
+            if path == "/health":
+                self._json({"success": True, "ok": True, "t": int(time.time())})
+                return
+            if path in ("", "/", "/api/index.py", "/api", "/index"):
                 params = parse_qs(parsed.query)
                 username = (params.get("username") or params.get("u") or [""])[0]
                 if not username:
-                    self._json({
-                        "success": True,
-                        "service": "uranium-insta-lookup",
-                        "usage": "GET /?username=<handle> | GET /health | GET /img?username=<handle> | POST {\"action\":\"instagram_lookup\",\"username\":\"...\"}",
-                    })
+                    self._json({"ok": True})  # liveness only; no usage disclosure
                     return
-                if not self._rate_checked():
+                if not self._rate_ok():
+                    return
+                ok, err = check_operation(*_creds_from(self.headers, params, None))
+                if not ok:
+                    self._deny(err)
                     return
                 status, payload = lookup_instagram(username)
                 self._json(payload, status)
                 return
-            if path == "/health":
-                self._json({"success": True, "ok": True, "time": int(time.time())})
-                return
             if path == "/img":
                 params = parse_qs(parsed.query)
                 username = (params.get("username") or params.get("u") or [""])[0]
-                if not self._rate_checked():
+                if not username:
+                    self._deny("NOT_FOUND")
+                    return
+                if not self._rate_ok():
+                    return
+                ok, err = check_operation(*_creds_from(self.headers, params, None))
+                if not ok:
+                    self._deny(err)
                     return
                 status, payload = lookup_instagram(username)
                 avatar = ((payload or {}).get("data") or {}).get("avatar_url") if status == 200 else None
@@ -469,11 +530,11 @@ class handler(BaseHTTPRequestHandler):
                     self.send_header("Cache-Control", f"public, max-age={CACHE_TTL_OK}")
                     self.end_headers()
                     return
-                self._json({"success": False, "error": "NO_AVATAR"}, 404)
+                self._deny("NOT_FOUND")
                 return
-            self._json({"success": False, "error": "NOT_FOUND", "detail": "try /?username=... or /health"}, 404)
-        except Exception as exc:  # never leak a stacktrace to the client
-            self._json({"success": False, "error": "INTERNAL", "detail": str(exc)}, 500)
+            self._deny("NOT_FOUND")
+        except Exception:
+            self._json({"success": False, "error": "INTERNAL"}, 500)
 
     def do_POST(self):
         try:
@@ -481,9 +542,9 @@ class handler(BaseHTTPRequestHandler):
             if length <= 0 or length > 16384:
                 self._json({"success": False, "error": "BAD_BODY"}, 400)
                 return
-            raw = self.rfile.read(length)
+            data = {}
             try:
-                data = json.loads(raw.decode("utf-8"))
+                data = json.loads(self.rfile.read(length).decode("utf-8"))
             except (ValueError, UnicodeDecodeError):
                 self._json({"success": False, "error": "BAD_JSON"}, 400)
                 return
@@ -492,12 +553,17 @@ class handler(BaseHTTPRequestHandler):
                 return
             action = str(data.get("action") or "instagram_lookup").lower().strip()
             if action not in ("instagram_lookup", "ig_lookup", "lookup", "instagram", "profile"):
-                self._json({"success": False, "error": "UNKNOWN_ACTION", "detail": "use action=instagram_lookup"}, 400)
+                self._json({"success": False, "error": "UNKNOWN_ACTION"}, 400)
                 return
-            if not self._rate_checked():
+            if not self._rate_ok():
+                return
+            # body credentials only here; the Lua client uses this path
+            ok, err = check_operation(*_creds_from(self.headers, {}, data))
+            if not ok:
+                self._deny(err)
                 return
             username = data.get("username") or data.get("query") or data.get("u")
             status, payload = lookup_instagram(username)
             self._json(payload, status)
-        except Exception as exc:
-            self._json({"success": False, "error": "INTERNAL", "detail": str(exc)}, 500)
+        except Exception:
+            self._json({"success": False, "error": "INTERNAL"}, 500)
