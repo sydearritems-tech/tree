@@ -23,7 +23,7 @@ const IG_HEADERS = {
   "x-ig-app-id": EDGE_APP_ID, "x-ig-www-claim": "0", "x-asbd-id": "350685817",
   "x-instagram-ajax": "1", "sec-fetch-dest": "empty", "sec-fetch-mode": "cors", "sec-fetch-site": "same-origin",
 };
-const HTML_HEADERS = { "User-Agent": UA, Accept: "text/html,application/xhtml+xml", "Accept-Language": "en-US,en;q=0.9" };
+const HTML_HEADERS = { "User-Agent": UA, Accept: "text/html,application/xhtml+xml", "Accept-Language": "en-US,en;q=0.9", "Accept-Encoding": "identity" };
 const CRAWLER_HEADERS = { "User-Agent": "facebookexternalhit/1.1;line=1.0", Accept: "*/*" };
 
 const USERNAME_RE = /^[A-Za-z0-9._]{1,30}$/;
@@ -224,7 +224,7 @@ async function fetchOpengraph(username) {
 async function waybackCdx(username) {
   const q = "https://web.archive.org/cdx/search/cdx?url=" + encodeURIComponent("instagram.com/" + username + "/") + "&output=json&fl=timestamp,original&filter=statuscode:200&limit=-5&collapse=digest";
   try {
-    const r = await fetchWithDeadline(q, { headers: { Accept: "application/json" }, method: "GET" });
+    const r = await fetchWithDeadline(q, { headers: { "User-Agent": UA, Accept: "application/json", "Accept-Encoding": "identity" }, method: "GET" });
     if (r.status !== 200) return null;
     const rows = await r.json();
     if (!Array.isArray(rows) || rows.length < 2) return null;
@@ -239,7 +239,7 @@ async function waybackCdx(username) {
 async function fetchWayback(username) {
   let avail = null; let availStatus = 0;
   try {
-    const r = await fetchWithDeadline("https://archive.org/wayback/available?url=" + encodeURIComponent("https://www.instagram.com/" + username + "/"), { headers: { "User-Agent": UA, Accept: "application/json" }, method: "GET" });
+    const r = await fetchWithDeadline("https://archive.org/wayback/available?url=" + encodeURIComponent("https://www.instagram.com/" + username + "/"), { headers: { "User-Agent": UA, Accept: "application/json", "Accept-Encoding": "identity" }, method: "GET" });
     availStatus = r.status;
     if (r.status === 429 || r.status === 503) return [null, "rate_limited"];
     avail = r.status === 200 ? await r.json() : null;
