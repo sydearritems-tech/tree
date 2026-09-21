@@ -222,15 +222,17 @@ async function fetchOpengraph(username) {
 }
 
 async function fetchWayback(username) {
-  let avail;
+  let avail = null; let availStatus = 0;
   try {
     const r = await fetchWithDeadline("https://archive.org/wayback/available?url=" + encodeURIComponent("https://www.instagram.com/" + username + "/"), { headers: { Accept: "application/json" }, method: "GET" });
+    availStatus = r.status;
+    if (r.status === 429 || r.status === 503) return [null, "rate_limited"];
     avail = r.status === 200 ? await r.json() : null;
   } catch { return [null, "unreachable"]; }
   const snap = (avail && avail.archived_snapshots && avail.archived_snapshots.closest) || {};
   let snapUrl = String(snap.url || "");
   const ts = String(snap.timestamp || "");
-  if (!snapUrl) return [null, "no_snapshot"];
+  if (!snapUrl) return [null, availStatus ? "http_" + availStatus : "no_snapshot"];
   snapUrl = snapUrl.replace(/^http:\/\//, "https://").replace(/\/web\/(\d{14})\/?$/, "/web/$1id_/");
   const targets = [snapUrl];
   const rebuilt = "https://web.archive.org/web/" + ts + "id_/https://www.instagram.com/" + username + "/";
@@ -274,7 +276,13 @@ async function fetchEmbed(username) {
   return prof ? [prof, null] : [null, "empty_embed"];
 }
 
-const CHAIN = [fetchWebProfile, fetchOpengraph, fetchOgScrape, fetchWayback, fetchEmbed];
+const CHAIN = [
+  { name: "webprofile", f: fetchWebProfile },
+  { name: "opengraph", f: fetchOpengraph },
+  { name: "ogscrape", f: fetchOgScrape },
+  { name: "wayback", f: fetchWayback },
+  { name: "embed", f: fetchEmbed },
+];
 
 async function lookupImpl(username) {
   let profile = null, sawRate = false, sawMissing = false;
@@ -284,13 +292,13 @@ async function lookupImpl(username) {
   while (true) {
     attempt += 1;
     let transient = false;
-    for (const source of CHAIN) {
+    for (const src of CHAIN) {
       if (isComplete(profile)) break;
       if (Date.now() > deadline) { transient = false; break; }
       let res, err;
       const t0 = Date.now();
-      try { [res, err] = await source(username); } catch (e) { res = null; err = "source_error"; trace.push({ s: source.name, e: String(e && e.message || e).slice(0, 60), ms: Date.now() - t0 }); }
-      if (err) trace.push({ s: source.name, e: err, ms: Date.now() - t0 });
+      try { [res, err] = await src.f(username); } catch (e) { res = null; err = "source_error"; trace.push({ s: src.name, e: String(e && e.message || e).slice(0, 60), ms: Date.now() - t0 }); }
+      if (err) trace.push({ s: src.name, e: err, ms: Date.now() - t0 });
       if (res) { profile = mergeProfile(profile, res); continue; }
       if (err === "NOT_FOUND" || err === "SOFT_NOT_FOUND") sawMissing = true;
       else if (err === "rate_limited" || err === "http_429" || err === "http_503") { sawRate = true; transient = true; }
