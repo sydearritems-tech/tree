@@ -212,7 +212,7 @@ async function fetchWebProfile(username) {
 }
 
 async function fetchOpengraph(username) {
-  const r = await fetchText("https://www.instagram.com/" + encodeURIComponent(username) + "/opengraph/", { headers: CRAWLER_HEADERS, method: "GET" });
+  const r = await fetchText("https://www.instagram.com/" + encodeURIComponent(username) + "/opengraph", { headers: HTML_HEADERS, method: "GET" });
   if (r.status === 429 || r.status === 503) return [null, "rate_limited"];
   if (r.status === 404) return ABSENCE_RE.test(r.text) ? [null, "NOT_FOUND"] : [null, "http_404"];
   if (r.status !== 200 || !r.text) return [null, "http_" + r.status];
@@ -254,6 +254,16 @@ async function fetchWayback(username) {
   return [prof, null];
 }
 
+async function fetchOgScrape(username) {
+  const r = await fetchText("https://www.instagram.com/" + encodeURIComponent(username) + "/", { headers: HTML_HEADERS, method: "GET" });
+  if (r.status === 429 || r.status === 503) return [null, "rate_limited"];
+  if (r.status === 404) return MISSING_RE.test(r.text) ? [null, "NOT_FOUND"] : [null, "http_404"];
+  if (r.status !== 200 || !r.text) return [null, "http_" + r.status];
+  if (MISSING_RE.test(r.text)) return [null, "NOT_FOUND"];
+  const prof = parseOgHtml(r.text, username);
+  return prof ? [prof, null] : [null, "empty_html"];
+}
+
 async function fetchEmbed(username) {
   const r = await fetchText("https://www.instagram.com/" + encodeURIComponent(username) + "/embed/captioned/", { headers: HTML_HEADERS, method: "GET" });
   if (r.status !== 200 || !r.text) return [null, "http_" + r.status];
@@ -264,10 +274,11 @@ async function fetchEmbed(username) {
   return prof ? [prof, null] : [null, "empty_embed"];
 }
 
-const CHAIN = [fetchWebProfile, fetchOpengraph, fetchWayback, fetchEmbed];
+const CHAIN = [fetchWebProfile, fetchOpengraph, fetchOgScrape, fetchWayback, fetchEmbed];
 
 async function lookupImpl(username) {
   let profile = null, sawRate = false, sawMissing = false;
+  const trace = [];
   const deadline = Date.now() + TOTAL_BUDGET;
   let attempt = 0;
   while (true) {
@@ -277,7 +288,9 @@ async function lookupImpl(username) {
       if (isComplete(profile)) break;
       if (Date.now() > deadline) { transient = false; break; }
       let res, err;
-      try { [res, err] = await source(username); } catch { res = null; err = "source_error"; }
+      const t0 = Date.now();
+      try { [res, err] = await source(username); } catch (e) { res = null; err = "source_error"; trace.push({ s: source.name, e: String(e && e.message || e).slice(0, 60), ms: Date.now() - t0 }); }
+      if (err) trace.push({ s: source.name, e: err, ms: Date.now() - t0 });
       if (res) { profile = mergeProfile(profile, res); continue; }
       if (err === "NOT_FOUND" || err === "SOFT_NOT_FOUND") sawMissing = true;
       else if (err === "rate_limited" || err === "http_429" || err === "http_503") { sawRate = true; transient = true; }
@@ -287,7 +300,7 @@ async function lookupImpl(username) {
     if (attempt >= 2 || Date.now() + 1500 > deadline) break;
     await new Promise(r => setTimeout(r, 1200));
   }
-  return [profile, sawRate, sawMissing];
+  return [profile, sawRate, sawMissing, trace];
 }
 
 function jsonOut(status, obj) {
@@ -328,7 +341,7 @@ async function handle(request) {
   const hit = cacheGet(username);
   if (hit) { const [st, pl] = hit; return jsonOut(st, Object.assign({}, pl, { cached: true })); }
 
-  const [profile, sawRate, sawMissing] = await lookupImpl(username);
+  const [profile, sawRate, sawMissing, trace] = await lookupImpl(username);
   if (profile && isComplete(profile)) {
     const data = Object.assign({}, profile, { fetched_at: Math.floor(Date.now() / 1000) });
     for (const k of PROFILE_KEYS) if (!filled(data[k])) delete data[k];
@@ -348,7 +361,7 @@ async function handle(request) {
     cacheSet(username, 404, payload, CACHE_TTL_NOT_FOUND);
     return jsonOut(404, payload);
   }
-  const payload = { success: false, error: sawRate ? "RATE_LIMITED" : "UPSTREAM_UNAVAILABLE" };
+  const payload = { success: false, error: sawRate ? "RATE_LIMITED" : "UPSTREAM_UNAVAILABLE", trace };
   cacheSet(username, 502, payload, CACHE_TTL_BUSY);
   return jsonOut(502, payload);
 }
