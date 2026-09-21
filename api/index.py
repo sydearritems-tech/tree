@@ -613,10 +613,156 @@ def _fetch_og_scrape(username):
     return profile, None
 
 
-FETCH_CHAIN = (
-    _fetch_relay, _fetch_web_profile, _fetch_private_api_json,
-    _fetch_embed, _fetch_wayback, _fetch_opengraph, _fetch_og_scrape,
+_MIRROR_HOSTS = (
+    ("https://imginn.com/p/api/profile/{u}/", "https://imginn.com"),
+    ("https://www.pixnoy.com/p/api/profile/{u}/", "https://www.pixnoy.com"),
+    ("https://appimginn.com/api/profile/{u}/", "https://imginn.com"),
 )
+
+
+def _fetch_mirror(username):
+    """Viewer-network JSON APIs (imginn family): live data, no login, free.
+    Usually Cloudflare-guarded; egress-dependent. On success returns the same
+    normalized profile dict the other fetchers produce."""
+    def _int(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    last = "unreachable"
+    for tpl, origin in _MIRROR_HOSTS:
+        url = tpl.format(u=username)
+        try:
+            resp = _SESSION.get(url, timeout=9, headers={
+                "Accept": "application/json",
+                "Origin": origin,
+                "Referer": origin + "/",
+                "X-Requested-With": "XMLHttpRequest",
+            })
+        except requests.RequestException:
+            last = "unreachable"
+            continue
+        if resp.status_code == 403:
+            last = "cf_blocked"
+            continue
+        if resp.status_code in (429, 503):
+            last = "rate_limited"
+            continue
+        if resp.status_code != 200:
+            last = "http_%s" % resp.status_code
+            continue
+        try:
+            payload = resp.json()
+        except ValueError:
+            last = "bad_json"
+            continue
+        prof_raw = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(prof_raw, dict) or not prof_raw.get("username"):
+            last = "no_data"
+            continue
+        uname = str(prof_raw.get("username") or "").strip().lower()
+        if uname != username.lower():
+            last = "no_data"
+            continue
+        profile = {
+            "username": uname,
+            "full_name": prof_raw.get("full_name") or prof_raw.get("fullname") or "",
+            "biography": prof_raw.get("biographie") or prof_raw.get("bio") or "",
+            "followers": _int(prof_raw.get("followers_count") or prof_raw.get("edge_followed_by", {}).get("count") if isinstance(prof_raw.get("edge_followed_by"), dict) else prof_raw.get("followers_count")),
+            "following": _int(prof_raw.get("following_count")),
+            "posts": _int(prof_raw.get("media_count")),
+            "avatar_url": prof_raw.get("profile_pic_url_hd") or prof_raw.get("profile_pic_url") or "",
+            "is_private": bool(prof_raw.get("is_private")),
+            "is_verified": bool(prof_raw.get("is_verified")),
+            "external_url": prof_raw.get("external_url") or "",
+            "mirror": True,
+        }
+        return profile, None
+    return None, last
+
+
+SC_BASE_URL = "https://www.socialcrawl.dev/v1/instagram/profile"
+SC_TIMEOUT = float(os.environ.get("IG_SC_TIMEOUT", "16"))
+
+
+def _socialcrawl_enabled():
+    return bool((os.environ.get("SOCIALCRAWL_API_KEY") or "").strip())
+
+
+def _fetch_socialcrawl(username):
+    """SocialCrawl live profile (1 credit per profile read on a cold miss;
+    cached reads and definitive 404s are refunded). Last fallback in the
+    request chain when the key is configured; background warm never uses it
+    so retries can never burn credits."""
+    key = (os.environ.get("SOCIALCRAWL_API_KEY") or "").strip()
+    if not key:
+        return None, "sc_unconfigured"
+    try:
+        resp = _SESSION.get(SC_BASE_URL, params={"handle": username},
+                            headers={"x-api-key": key, "Accept": "application/json"},
+                            timeout=SC_TIMEOUT)
+    except requests.RequestException:
+        return None, "sc_unreachable"
+    except Exception:
+        return None, "sc_source_error"
+    if resp.status_code == 404:
+        etype = ""
+        try:
+            etype = str(((resp.json() or {}).get("error") or {}).get("type") or "")
+        except ValueError:
+            pass
+        return None, "NOT_FOUND" if etype == "RESOURCE_NOT_FOUND" else "sc_http_404"
+    # deliberate: SC-side 429/402 stay out of the retry buckets - an in-request
+    # replay would spend a second credit while the free sources answer fine
+    if resp.status_code == 402:
+        return None, "sc_out_of_credits"
+    if resp.status_code in (429, 503):
+        return None, "sc_rate_limited"
+    if resp.status_code != 200:
+        return None, "sc_http_%s" % resp.status_code
+    try:
+        body = resp.json()
+    except ValueError:
+        return None, "sc_bad_json"
+    if not isinstance(body, dict) or not body.get("success"):
+        return None, "sc_error"
+    author = ((body.get("data") or {}).get("author") or {})
+    if not isinstance(author, dict) or not author.get("username"):
+        return None, "sc_no_data"
+
+    def _int(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    profile = {
+        "username": str(author.get("username") or "").lower(),
+        "full_name": str(author.get("display_name") or author.get("full_name") or ""),
+        "biography": str(author.get("bio") or author.get("biography") or ""),
+        "followers": _int(author.get("followers")),
+        "following": _int(author.get("following")),
+        "posts": _int(author.get("posts_count") or author.get("media_count")),
+        "avatar_url": str(author.get("avatar_url") or author.get("profile_pic_url") or ""),
+        "is_private": bool(author.get("private")),
+        "is_verified": bool(author.get("verified")),
+        "external_url": str(author.get("url") or author.get("external_url") or ""),
+        "source": "socialcrawl",
+    }
+    return profile, None
+
+
+_BASE_CHAIN = (
+    _fetch_relay, _fetch_web_profile, _fetch_private_api_json,
+    _fetch_embed, _fetch_mirror, _fetch_wayback, _fetch_opengraph, _fetch_og_scrape,
+)
+
+# Credit safety: SC sits LAST so free sources answer everything they can
+# (nba-class fills from wayback at zero cost); only accounts the entire free
+# chain starves burn one credit. Warm retries skip SC entirely: no retry storm.
+FETCH_CHAIN = _BASE_CHAIN + (_fetch_socialcrawl,) if _socialcrawl_enabled() else _BASE_CHAIN
+FETCH_CHAIN_WARM = _BASE_CHAIN
 
 # fields that make a profile "complete" -> stop querying more sources
 _PRIMARY_FIELDS = ("full_name", "avatar_url", "followers", "following", "posts")
@@ -641,7 +787,13 @@ def _merge_profile(base, extra):
 
 
 def _is_complete(profile):
-    return all(_is_filled(profile.get(key)) for key in _PRIMARY_FIELDS)
+    for key in _PRIMARY_FIELDS:
+        if _is_filled(profile.get(key)):
+            continue
+        if key == "posts" and profile.get("source") == "socialcrawl":
+            continue  # SC's profile endpoint omits posts_count; not worth a second credit call
+        return False
+    return True
 
 
 # --------------------------------------------------------------------------
@@ -714,7 +866,7 @@ def _warm_pass(username):
     """One fresh pass through the fetch chain; returns merged profile|None."""
     profile = None
     started = time.monotonic()
-    for fetcher in FETCH_CHAIN:
+    for fetcher in FETCH_CHAIN_WARM:
         if profile is not None and _is_complete(profile):
             break
         if time.monotonic() - started > FETCH_DEADLINE:
@@ -968,7 +1120,7 @@ class handler(BaseHTTPRequestHandler):
                 self._json({"success": False, "error": "BAD_BODY"}, 400)
                 return
             action = str(data.get("action") or "instagram_lookup").lower().strip()
-            if action not in ("instagram_lookup", "ig_lookup", "lookup", "instagram", "profile"):
+            if action not in ("instagram_lookup", "ig_lookup", "lookup", "instagram", "profile", "mirror_probe"):
                 self._json({"success": False, "error": "UNKNOWN_ACTION"}, 400)
                 return
             if not self._rate_ok():
@@ -977,6 +1129,16 @@ class handler(BaseHTTPRequestHandler):
             ok, err = check_operation(*_creds_from(self.headers, {}, data))
             if not ok:
                 self._deny(err)
+                return
+            if action == "mirror_probe":
+                out = []
+                for probe_user in ("nba", "empik"):
+                    try:
+                        prof, perr = _fetch_mirror(probe_user)
+                    except Exception as exc:
+                        prof, perr = None, "exc_" + type(exc).__name__
+                    out.append({"u": probe_user, "err": perr, "data": prof})
+                self._json({"success": True, "probe": out}, 200)
                 return
             username = data.get("username") or data.get("query") or data.get("u")
             status, payload = lookup_instagram(username)
