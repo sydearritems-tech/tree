@@ -221,18 +221,38 @@ async function fetchOpengraph(username) {
   return prof ? [prof, null] : [null, "empty_html"];
 }
 
+async function waybackCdx(username) {
+  const q = "https://web.archive.org/cdx/search/cdx?url=" + encodeURIComponent("instagram.com/" + username + "/") + "&output=json&fl=timestamp,original&filter=statuscode:200&limit=-5&collapse=digest";
+  try {
+    const r = await fetchWithDeadline(q, { headers: { Accept: "application/json" }, method: "GET" });
+    if (r.status !== 200) return null;
+    const rows = await r.json();
+    if (!Array.isArray(rows) || rows.length < 2) return null;
+    const last = rows[rows.length - 1];
+    const ts = String(last[0] || "");
+    const orig = String(last[1] || "");
+    if (!/^\d{14}$/.test(ts)) return null;
+    return { ts, orig };
+  } catch { return null; }
+}
+
 async function fetchWayback(username) {
   let avail = null; let availStatus = 0;
   try {
-    const r = await fetchWithDeadline("https://archive.org/wayback/available?url=" + encodeURIComponent("https://www.instagram.com/" + username + "/"), { headers: { Accept: "application/json" }, method: "GET" });
+    const r = await fetchWithDeadline("https://archive.org/wayback/available?url=" + encodeURIComponent("https://www.instagram.com/" + username + "/"), { headers: { "User-Agent": UA, Accept: "application/json" }, method: "GET" });
     availStatus = r.status;
     if (r.status === 429 || r.status === 503) return [null, "rate_limited"];
     avail = r.status === 200 ? await r.json() : null;
-  } catch { return [null, "unreachable"]; }
+  } catch { avail = null; }
   const snap = (avail && avail.archived_snapshots && avail.archived_snapshots.closest) || {};
   let snapUrl = String(snap.url || "");
-  const ts = String(snap.timestamp || "");
-  if (!snapUrl) return [null, availStatus ? "http_" + availStatus : "no_snapshot"];
+  let ts = String(snap.timestamp || "");
+  if (!snapUrl) {
+    const cdx = await waybackCdx(username);
+    if (!cdx) return [null, availStatus ? "http_" + availStatus : "no_snapshot"];
+    ts = cdx.ts;
+    snapUrl = "https://web.archive.org/web/" + cdx.ts + "id_/" + (cdx.orig || "https://www.instagram.com/" + username + "/");
+  }
   snapUrl = snapUrl.replace(/^http:\/\//, "https://").replace(/\/web\/(\d{14})\/?$/, "/web/$1id_/");
   const targets = [snapUrl];
   const rebuilt = "https://web.archive.org/web/" + ts + "id_/https://www.instagram.com/" + username + "/";
@@ -320,7 +340,7 @@ function jsonOut(status, obj) {
 async function handle(request) {
   const url = new URL(request.url);
   if (request.method !== "POST") {
-    if (url.pathname === "/health" || url.pathname === "/") return jsonOut(200, { ok: "edge", ts: Math.floor(Date.now() / 1000) });
+    if (url.pathname === "/health" || url.pathname === "/edge" || url.pathname === "/") return jsonOut(200, { ok: "edge", region: process.env.VERCEL_REGION || "unknown", ts: Math.floor(Date.now() / 1000) });
     return jsonOut(405, { success: false, error: "METHOD_NOT_ALLOWED" });
   }
   let body = {};
@@ -369,7 +389,7 @@ async function handle(request) {
     cacheSet(username, 404, payload, CACHE_TTL_NOT_FOUND);
     return jsonOut(404, payload);
   }
-  const payload = { success: false, error: sawRate ? "RATE_LIMITED" : "UPSTREAM_UNAVAILABLE", trace };
+  const payload = { success: false, error: sawRate ? "RATE_LIMITED" : "UPSTREAM_UNAVAILABLE", region: process.env.VERCEL_REGION || "unknown", trace };
   cacheSet(username, 502, payload, CACHE_TTL_BUSY);
   return jsonOut(502, payload);
 }
